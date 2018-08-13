@@ -64,9 +64,6 @@ static uint8_t g_dest_mac_addr[ETH_ALEN] = { 0x00, 0x0d, 0x3a, 0xf4, 0x56, 0x28 
 // Everyone seems to use 32. Nobody seems to know why.
 #define BURST_SIZE 32
 
-// In DPDK, a "port" is a NIC. We will use the first NIC DPDK finds.
-#define DPDK_PORT_ID 0
-
 
 // ****************************************************************************
 // Do not tweak these values.
@@ -80,28 +77,45 @@ static uint8_t g_src_mac_addr[ETH_ALEN]; // This will be set automatically at ru
 #define DPDK_QUEUE_ID_TX 0
 
 
+// In DPDK, a "port" is a NIC. We will use the first NIC DPDK finds.
+int g_dpdkPortId = -1;
+
 static const struct rte_eth_conf port_conf_default = {
     .rxmode = { .max_rx_pkt_len = ETHER_MAX_LEN }
 };
 
 
 static void port_init(struct rte_mempool *mbuf_pool) {
+    // Find the first free DPDK enabled network interface. When running on
+    // Azure, the TAP PMD and MLX4 PMD will both advertise a port. We must not
+    // use them directly. Instead we want the fail-safe PMD which sits on top
+    // of them. The fail-safe will already have taken ownership of the TAP and
+    // MLX4 PMDs, so we won't see them as available in this loop.
+    g_dpdkPortId = 0;
+    while (g_dpdkPortId < RTE_MAX_ETHPORTS &&
+	       rte_eth_devices[g_dpdkPortId].data->owner.id != RTE_ETH_DEV_NO_OWNER) {
+		g_dpdkPortId++;
+    }
+    if (g_dpdkPortId == RTE_MAX_ETHPORTS) {
+        rte_exit(EXIT_FAILURE, "There were no DPDK ports free.\n");
+    }
+ 
     // Configure the Ethernet device.
     const int num_rx_queues = 0;
     const int num_tx_queues = 1;
     struct rte_eth_conf port_conf = port_conf_default;
-    if (rte_eth_dev_configure(DPDK_PORT_ID, num_rx_queues, num_tx_queues, &port_conf)) {
+    if (rte_eth_dev_configure(g_dpdkPortId, num_rx_queues, num_tx_queues, &port_conf)) {
         rte_exit(EXIT_FAILURE, "rte_eth_dev_configure() failed.\n");
     }
 
     // Set up TX queue.
-    if (rte_eth_tx_queue_setup(DPDK_PORT_ID, DPDK_QUEUE_ID_TX, TX_RING_SIZE,
-            rte_eth_dev_socket_id(DPDK_PORT_ID), NULL) < 0) {
+    if (rte_eth_tx_queue_setup(g_dpdkPortId, DPDK_QUEUE_ID_TX, TX_RING_SIZE,
+            rte_eth_dev_socket_id(g_dpdkPortId), NULL) < 0) {
         rte_exit(EXIT_FAILURE, "Couldn't setup TX queue.\n");
     }
 
     // Start the Ethernet port.
-    if (rte_eth_dev_start(DPDK_PORT_ID) < 0) {
+    if (rte_eth_dev_start(g_dpdkPortId) < 0) {
         rte_exit(EXIT_FAILURE, "Device start failed.\n");
     }
 }
@@ -197,7 +211,7 @@ static void do_send(struct rte_mempool *mbuf_pool, int num_to_send) {
         }
 
         // Send as many packets as will fit in the TX ring.
-        int num_sent = rte_eth_tx_burst(DPDK_PORT_ID, DPDK_QUEUE_ID_TX, mbufs, num_to_send_this_burst);
+        int num_sent = rte_eth_tx_burst(g_dpdkPortId, DPDK_QUEUE_ID_TX, mbufs, num_to_send_this_burst);
 
         printf("Sent %i packets\n", num_sent);
         num_packets_left -= num_sent;
@@ -220,7 +234,7 @@ int main(int argc, char *argv[]) {
 
     port_init(mbuf_pool);
 
-    rte_eth_macaddr_get(DPDK_PORT_ID, (struct ether_addr *)g_src_mac_addr);
+    rte_eth_macaddr_get(g_dpdkPortId, (struct ether_addr *)g_src_mac_addr);
     printf("Our MAC: %02x %02x %02x %02x %02x %02x\n",
             g_src_mac_addr[0], g_src_mac_addr[1],
             g_src_mac_addr[2], g_src_mac_addr[3],
